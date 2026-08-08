@@ -167,6 +167,17 @@ def find_contract(
     return None
 
 
+def get_sector_fallback(ticker: str) -> Optional[str]:
+    """Best-effort sector lookup via yfinance, used when a ticker isn't in the sector config map."""
+    _require_yfinance()
+    try:
+        info = yf.Ticker(ticker).info or {}
+        return info.get("sector")
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("sector lookup failed for %s: %s", ticker, exc)
+        return None
+
+
 def get_option_market_data(
     chain_snapshot: dict, expiry: str, option_type: str, strike: float
 ) -> dict:

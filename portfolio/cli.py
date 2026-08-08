@@ -1,9 +1,14 @@
 """Orchestrates one valuation run: pull market data, snapshot chains, compute
-greeks + valuation, persist everything to SQLite, and print a summary.
+greeks + valuation, roll up portfolio-level allocation/greeks/IV analytics,
+persist everything to SQLite, and print a summary.
 
     python -m portfolio.cli [--positions positions.json] [--db portfolio.db]
                              [--snapshot-dir snapshots] [--asof 2026-08-08]
-                             [--risk-free-rate 0.045]
+                             [--risk-free-rate 0.045] [--sector-map sector_map.json]
+                             [--ticker-cap 0.40] [--sector-cap 0.60]
+                             [--iv-lookback-days 252] [--iv-min-history-days 20]
+                             [--iv-rich-threshold 70] [--iv-cheap-threshold 30]
+                             [--near-expiry-dte 45]
 
 --asof stamps the run's asof_date for storage/diffing. Marks always come
 from the live feed pulled right now -- this does not reconstruct historical
@@ -17,6 +22,7 @@ import logging
 from datetime import date, datetime
 
 from . import config, db as db_module
+from .analytics import PortfolioAnalytics, compute_portfolio_analytics, print_analytics_report, save_portfolio_analytics
 from .black_scholes import compute_greeks
 from .market_data import (
     MarketDataError,
@@ -25,6 +31,7 @@ from .market_data import (
     get_underlying_quote,
 )
 from .models import Position, load_positions_file
+from .sectors import load_sector_map
 from .snapshot import write_snapshot
 from .valuation import Valuation, compute_valuation
 
@@ -47,6 +54,37 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=float,
         default=config.DEFAULT_RISK_FREE_RATE,
         help=f"Annual risk-free rate as a decimal (default {config.DEFAULT_RISK_FREE_RATE})",
+    )
+    p.add_argument(
+        "--sector-map", default=config.DEFAULT_SECTOR_MAP_FILE, help="Path to ticker->sector config JSON"
+    )
+    p.add_argument(
+        "--ticker-cap", type=float, default=config.DEFAULT_TICKER_CONCENTRATION_CAP,
+        help=f"Informational concentration cap per ticker, as a fraction (default {config.DEFAULT_TICKER_CONCENTRATION_CAP})",
+    )
+    p.add_argument(
+        "--sector-cap", type=float, default=config.DEFAULT_SECTOR_CONCENTRATION_CAP,
+        help=f"Informational concentration cap per sector, as a fraction (default {config.DEFAULT_SECTOR_CONCENTRATION_CAP})",
+    )
+    p.add_argument(
+        "--iv-lookback-days", type=int, default=config.DEFAULT_IV_LOOKBACK_DAYS,
+        help=f"IV rank/percentile lookback window in days (default {config.DEFAULT_IV_LOOKBACK_DAYS})",
+    )
+    p.add_argument(
+        "--iv-min-history-days", type=int, default=config.DEFAULT_IV_MIN_HISTORY_DAYS,
+        help=f"Minimum sampled days before IV rank/percentile is reported (default {config.DEFAULT_IV_MIN_HISTORY_DAYS})",
+    )
+    p.add_argument(
+        "--iv-rich-threshold", type=float, default=config.DEFAULT_IV_RICH_THRESHOLD,
+        help=f"IV rank above which a position is flagged rich (default {config.DEFAULT_IV_RICH_THRESHOLD})",
+    )
+    p.add_argument(
+        "--iv-cheap-threshold", type=float, default=config.DEFAULT_IV_CHEAP_THRESHOLD,
+        help=f"IV rank below which a position is flagged cheap (default {config.DEFAULT_IV_CHEAP_THRESHOLD})",
+    )
+    p.add_argument(
+        "--near-expiry-dte", type=int, default=config.DEFAULT_NEAR_EXPIRY_DTE,
+        help=f"DTE at/under which a position is flagged for time-decay/roll visibility (default {config.DEFAULT_NEAR_EXPIRY_DTE})",
     )
     return p.parse_args(argv)
 
@@ -86,7 +124,7 @@ def value_position(
     return compute_valuation(position, market, asof, greeks)
 
 
-def run(argv=None) -> list[Valuation]:
+def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
 
@@ -96,10 +134,11 @@ def run(argv=None) -> list[Valuation]:
     positions = load_positions_file(args.positions)
     if not positions:
         logger.warning("No positions found in %s", args.positions)
-        return []
+        return [], None
 
     grouped = _group_by_ticker(positions)
     valuations: list[Valuation] = []
+    sector_map = load_sector_map(args.sector_map)
 
     with db_module.open_db(args.db) as conn:
         for position in positions:
@@ -138,8 +177,26 @@ def run(argv=None) -> list[Valuation]:
                 db_module.insert_valuation(conn, row)
                 valuations.append(valuation)
 
+        valued_positions = [p for p in positions if p.id in {v.position_id for v in valuations}]
+        analytics = compute_portfolio_analytics(
+            conn,
+            valued_positions,
+            valuations,
+            asof,
+            sector_map=sector_map,
+            ticker_cap=args.ticker_cap,
+            sector_cap=args.sector_cap,
+            iv_lookback_days=args.iv_lookback_days,
+            iv_min_history_days=args.iv_min_history_days,
+            iv_rich_threshold=args.iv_rich_threshold,
+            iv_cheap_threshold=args.iv_cheap_threshold,
+            near_expiry_dte=args.near_expiry_dte,
+        )
+        save_portfolio_analytics(conn, asof.isoformat(), run_timestamp, analytics)
+
     print_report(valuations, asof)
-    return valuations
+    print_analytics_report(analytics)
+    return valuations, analytics
 
 
 def print_report(valuations: list[Valuation], asof: date) -> None:

@@ -64,8 +64,55 @@ CREATE TABLE IF NOT EXISTS valuations (
     FOREIGN KEY (position_id) REFERENCES positions(id)
 );
 
+CREATE TABLE IF NOT EXISTS sector_cache (
+    ticker      TEXT PRIMARY KEY,
+    sector      TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS allocations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof_date       TEXT NOT NULL,
+    run_timestamp   TEXT NOT NULL,
+    dimension       TEXT NOT NULL,  -- 'ticker' | 'sector'
+    key             TEXT NOT NULL,
+    value           REAL NOT NULL,
+    pct_of_total    REAL NOT NULL,
+    cap_pct         REAL NOT NULL,
+    over_cap        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_greeks (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof_date                   TEXT NOT NULL,
+    run_timestamp               TEXT NOT NULL,
+    total_value                 REAL,
+    net_delta_shares            REAL,
+    daily_theta_dollars         REAL,
+    net_vega_dollars_per_point  REAL
+);
+
+CREATE TABLE IF NOT EXISTS iv_environment (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof_date       TEXT NOT NULL,
+    run_timestamp   TEXT NOT NULL,
+    position_id     TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    current_iv      REAL,
+    iv_rank         REAL,
+    iv_percentile   REAL,
+    sample_size     INTEGER NOT NULL,
+    status          TEXT NOT NULL,  -- 'ok' | 'building_history'
+    rich_cheap      TEXT,           -- 'rich' | 'cheap' | 'normal' | NULL
+    dte             INTEGER,
+    near_expiry     INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_date ON snapshots(ticker, asof_date);
 CREATE INDEX IF NOT EXISTS idx_valuations_position_date ON valuations(position_id, asof_date);
+CREATE INDEX IF NOT EXISTS idx_allocations_asof ON allocations(asof_date, dimension);
+CREATE INDEX IF NOT EXISTS idx_iv_environment_position_date ON iv_environment(position_id, asof_date);
 """
 
 
@@ -162,6 +209,21 @@ def get_prior_snapshot(
     return {"asof_date": row["asof_date"], "data": json.loads(row["data"])}
 
 
+def get_snapshots_in_range(
+    conn: sqlite3.Connection, ticker: str, start_date: str, end_date: str
+) -> list[dict]:
+    """All stored snapshots for `ticker` with start_date <= asof_date <= end_date, ascending."""
+    rows = conn.execute(
+        """
+        SELECT asof_date, data FROM snapshots
+        WHERE ticker = ? AND asof_date >= ? AND asof_date <= ?
+        ORDER BY asof_date ASC
+        """,
+        (ticker, start_date, end_date),
+    ).fetchall()
+    return [{"asof_date": r["asof_date"], "data": json.loads(r["data"])} for r in rows]
+
+
 def insert_valuation(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     columns = [
         "position_id", "asof_date", "run_timestamp", "ticker", "asset_type",
@@ -182,3 +244,61 @@ def latest_valuations(conn: sqlite3.Connection, asof_date: str) -> list[sqlite3.
         "SELECT * FROM valuations WHERE asof_date = ? ORDER BY ticker, position_id",
         (asof_date,),
     ).fetchall()
+
+
+def insert_allocation_row(
+    conn: sqlite3.Connection,
+    asof_date: str,
+    run_timestamp: str,
+    dimension: str,
+    key: str,
+    value: float,
+    pct_of_total: float,
+    cap_pct: float,
+    over_cap: bool,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO allocations
+            (asof_date, run_timestamp, dimension, key, value, pct_of_total, cap_pct, over_cap)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (asof_date, run_timestamp, dimension, key, value, pct_of_total, cap_pct, int(over_cap)),
+    )
+
+
+def insert_portfolio_greeks(
+    conn: sqlite3.Connection,
+    asof_date: str,
+    run_timestamp: str,
+    total_value: float,
+    net_delta_shares: float,
+    daily_theta_dollars: float,
+    net_vega_dollars_per_point: float,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO portfolio_greeks
+            (asof_date, run_timestamp, total_value, net_delta_shares,
+             daily_theta_dollars, net_vega_dollars_per_point)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (asof_date, run_timestamp, total_value, net_delta_shares,
+         daily_theta_dollars, net_vega_dollars_per_point),
+    )
+
+
+def insert_iv_environment(conn: sqlite3.Connection, asof_date: str, run_timestamp: str, row: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT INTO iv_environment
+            (asof_date, run_timestamp, position_id, ticker, current_iv, iv_rank,
+             iv_percentile, sample_size, status, rich_cheap, dte, near_expiry)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            asof_date, run_timestamp, row["position_id"], row["ticker"], row["current_iv"],
+            row["iv_rank"], row["iv_percentile"], row["sample_size"], row["status"],
+            row["rich_cheap"], row["dte"], int(row["near_expiry"]),
+        ),
+    )
