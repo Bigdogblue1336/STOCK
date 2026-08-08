@@ -11,7 +11,9 @@ from .allocation import AllocationResult, compute_allocation
 from .analytics import PortfolioAnalytics, compute_portfolio_analytics
 from .black_scholes import Greeks, compute_greeks
 from .iv_environment import IVEnvironment, compute_iv_environment
+from .macro_gate import MacroGate, MacroGateError, compute_macro_gate
 from .models import Position, PositionError, load_positions, load_positions_file
+from .news import NewsAnalysis, NewsAnalysisError, get_or_create_news_analysis
 from .valuation import Valuation, compute_valuation
 
 __all__ = [
@@ -31,4 +33,10 @@ __all__ = [
     "compute_iv_environment",
     "PortfolioAnalytics",
     "compute_portfolio_analytics",
+    "MacroGate",
+    "MacroGateError",
+    "compute_macro_gate",
+    "NewsAnalysis",
+    "NewsAnalysisError",
+    "get_or_create_news_analysis",
 ]

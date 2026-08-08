@@ -1,6 +1,7 @@
 """Orchestrates one valuation run: pull market data, snapshot chains, compute
 greeks + valuation, roll up portfolio-level allocation/greeks/IV analytics,
-persist everything to SQLite, and print a summary.
+score the deterministic macro gate, run daily Claude news analysis per held
+name, persist everything to SQLite, and print a summary.
 
     python -m portfolio.cli [--positions positions.json] [--db portfolio.db]
                              [--snapshot-dir snapshots] [--asof 2026-08-08]
@@ -9,6 +10,10 @@ persist everything to SQLite, and print a summary.
                              [--iv-lookback-days 252] [--iv-min-history-days 20]
                              [--iv-rich-threshold 70] [--iv-cheap-threshold 30]
                              [--near-expiry-dte 45]
+                             [--macro-weights '{"vix_level":0.25,...}']
+                             [--macro-lookback-days 252] [--breadth-tickers XLK,XLF,...]
+                             [--news-window-days 3] [--news-model claude-haiku-4-5-20251001]
+                             [--skip-news]
 
 --asof stamps the run's asof_date for storage/diffing. Marks always come
 from the live feed pulled right now -- this does not reconstruct historical
@@ -18,12 +23,14 @@ chains for a past date.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from datetime import date, datetime
 
 from . import config, db as db_module
 from .analytics import PortfolioAnalytics, compute_portfolio_analytics, print_analytics_report, save_portfolio_analytics
 from .black_scholes import compute_greeks
+from .macro_gate import MacroGate, MacroGateError, compute_macro_gate
 from .market_data import (
     MarketDataError,
     get_full_chain_snapshot,
@@ -31,6 +38,7 @@ from .market_data import (
     get_underlying_quote,
 )
 from .models import Position, load_positions_file
+from .news import NewsAnalysis, build_client, get_or_create_news_analysis
 from .sectors import load_sector_map
 from .snapshot import write_snapshot
 from .valuation import Valuation, compute_valuation
@@ -86,6 +94,35 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--near-expiry-dte", type=int, default=config.DEFAULT_NEAR_EXPIRY_DTE,
         help=f"DTE at/under which a position is flagged for time-decay/roll visibility (default {config.DEFAULT_NEAR_EXPIRY_DTE})",
     )
+    p.add_argument(
+        "--macro-weights", type=str, default=None,
+        help='JSON object of macro gate component weights, must sum to 1.0 '
+        '(default {"vix_level":0.25,"vix_term_structure":0.25,"breadth":0.25,"credit_spread":0.25})',
+    )
+    p.add_argument(
+        "--macro-lookback-days", type=int, default=config.DEFAULT_MACRO_LOOKBACK_DAYS,
+        help=f"Percentile lookback window for the macro gate, in days (default {config.DEFAULT_MACRO_LOOKBACK_DAYS})",
+    )
+    p.add_argument(
+        "--breadth-tickers", type=str, default=None,
+        help="Comma-separated breadth proxy basket (default: 11 SPDR sector ETFs)",
+    )
+    p.add_argument("--vix-ticker", default=config.DEFAULT_VIX_TICKER)
+    p.add_argument("--vix3m-ticker", default=config.DEFAULT_VIX3M_TICKER)
+    p.add_argument("--credit-hy-ticker", default=config.DEFAULT_CREDIT_HY_TICKER)
+    p.add_argument("--credit-safe-ticker", default=config.DEFAULT_CREDIT_SAFE_TICKER)
+    p.add_argument(
+        "--news-window-days", type=int, default=config.DEFAULT_NEWS_WINDOW_DAYS,
+        help=f"Headline lookback window for news analysis, in days (default {config.DEFAULT_NEWS_WINDOW_DAYS})",
+    )
+    p.add_argument(
+        "--news-model", default=config.DEFAULT_NEWS_MODEL,
+        help=f"Claude model for news analysis (default {config.DEFAULT_NEWS_MODEL})",
+    )
+    p.add_argument(
+        "--skip-news", action="store_true",
+        help="Skip the Claude news analysis phase entirely (no API calls, no charges)",
+    )
     return p.parse_args(argv)
 
 
@@ -124,17 +161,24 @@ def value_position(
     return compute_valuation(position, market, asof, greeks)
 
 
-def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics]:
+def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics, MacroGate, list[NewsAnalysis]]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
 
     asof = datetime.strptime(args.asof, "%Y-%m-%d").date() if args.asof else date.today()
     run_timestamp = datetime.utcnow().isoformat() + "Z"
 
+    macro_weights = json.loads(args.macro_weights) if args.macro_weights else None
+    breadth_tickers = (
+        [t.strip().upper() for t in args.breadth_tickers.split(",") if t.strip()]
+        if args.breadth_tickers
+        else None
+    )
+
     positions = load_positions_file(args.positions)
     if not positions:
         logger.warning("No positions found in %s", args.positions)
-        return [], None
+        positions = []
 
     grouped = _group_by_ticker(positions)
     valuations: list[Valuation] = []
@@ -194,9 +238,46 @@ def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics]:
         )
         save_portfolio_analytics(conn, asof.isoformat(), run_timestamp, analytics)
 
+        try:
+            macro_gate = compute_macro_gate(
+                asof,
+                weights=macro_weights,
+                lookback_days=args.macro_lookback_days,
+                breadth_tickers=breadth_tickers,
+                vix_ticker=args.vix_ticker,
+                vix3m_ticker=args.vix3m_ticker,
+                credit_hy_ticker=args.credit_hy_ticker,
+                credit_safe_ticker=args.credit_safe_ticker,
+            )
+        except MacroGateError as exc:
+            logger.error("Macro gate configuration error: %s", exc)
+            raise
+        db_module.insert_macro_gate(
+            conn, asof.isoformat(), run_timestamp, macro_gate.composite_score,
+            macro_gate.weights, [c.to_dict() for c in macro_gate.components],
+        )
+
+        news_results: list[NewsAnalysis] = []
+        if args.skip_news:
+            logger.info("News analysis skipped (--skip-news)")
+        else:
+            client = build_client()
+            if client is not None:
+                for ticker, ticker_positions in grouped.items():
+                    try:
+                        result = get_or_create_news_analysis(
+                            conn, client, ticker, ticker_positions, asof, run_timestamp,
+                            window_days=args.news_window_days, model=args.news_model,
+                        )
+                        news_results.append(result)
+                    except Exception as exc:
+                        logger.error("News analysis failed for %s: %s", ticker, exc)
+
     print_report(valuations, asof)
     print_analytics_report(analytics)
-    return valuations, analytics
+    print_macro_gate_report(macro_gate)
+    print_news_report(news_results)
+    return valuations, analytics, macro_gate, news_results
 
 
 def print_report(valuations: list[Valuation], asof: date) -> None:
@@ -220,6 +301,32 @@ def print_report(valuations: list[Valuation], asof: date) -> None:
         total_pnl += v.unrealized_pnl or 0.0
     print("-" * 100)
     print(f"{'TOTAL':<28}{'':>9}{total_value:>12,.2f}{total_pnl:>12,.2f}")
+
+
+def print_macro_gate_report(macro_gate: MacroGate) -> None:
+    print(f"\nMacro gate as of {macro_gate.asof_date} (deterministic, 0-100; general environment only)")
+    print("-" * 72)
+    score_str = f"{macro_gate.composite_score:.1f}" if macro_gate.composite_score is not None else "n/a"
+    print(f"  Composite score: {score_str}")
+    for c in macro_gate.components:
+        score_str = f"{c.score:.1f}" if c.score is not None else "n/a"
+        print(f"    {c.name:<20} score={score_str:<6} weight={c.weight:.2f}  {c.detail}")
+
+
+def print_news_report(news_results: list[NewsAnalysis]) -> None:
+    if not news_results:
+        return
+    print(f"\nDaily news analysis (Claude; informational only, not a trade signal)")
+    print("-" * 72)
+    for n in news_results:
+        cache_note = " (cached)" if n.from_cache else ""
+        flag_note = "  ** POSITION FLAG **" if n.position_flag else ""
+        print(f"\n  {n.ticker} [{n.sentiment}]{cache_note}{flag_note}")
+        print(f"    {n.summary}")
+        if n.key_drivers:
+            print(f"    Drivers: {', '.join(n.key_drivers)}")
+        if n.position_flag and n.position_flag_detail:
+            print(f"    Position note: {n.position_flag_detail}")
 
 
 if __name__ == "__main__":

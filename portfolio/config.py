@@ -31,3 +31,29 @@ DEFAULT_IV_CHEAP_THRESHOLD = 30.0  # IV rank below this => "cheap"
 
 # DTE at/under which a position is flagged for time-decay/roll visibility (fact only, no advice).
 DEFAULT_NEAR_EXPIRY_DTE = 45
+
+# --- Market context layer (macro gate + daily news) ---
+
+# Deterministic 0-100 macro gate: same data in, same score out. Component weights must sum to 1.0.
+DEFAULT_MACRO_LOOKBACK_DAYS = 252
+DEFAULT_MACRO_WEIGHTS = {
+    "vix_level": 0.25,
+    "vix_term_structure": 0.25,
+    "breadth": 0.25,
+    "credit_spread": 0.25,
+}
+DEFAULT_VIX_TICKER = "^VIX"
+DEFAULT_VIX3M_TICKER = "^VIX3M"
+DEFAULT_CREDIT_HY_TICKER = "HYG"
+DEFAULT_CREDIT_SAFE_TICKER = "TLT"
+# Breadth proxy: the 11 SPDR sector ETFs standing in for "% of SPY constituents above 200dma"
+# (pulling + computing 200dma for ~500 individual constituents daily isn't practical here).
+# Override with --breadth-tickers if you have a real constituent list to feed in.
+DEFAULT_BREADTH_TICKERS = [
+    "XLK", "XLF", "XLE", "XLY", "XLP", "XLI", "XLB", "XLU", "XLV", "XLRE", "XLC",
+]
+
+# Daily Claude news analysis: informational only, never a trade signal.
+DEFAULT_NEWS_WINDOW_DAYS = 3
+DEFAULT_NEWS_MODEL = os.environ.get("PORTFOLIO_NEWS_MODEL", "claude-haiku-4-5-20251001")
+DEFAULT_NEWS_MAX_TOKENS = 700

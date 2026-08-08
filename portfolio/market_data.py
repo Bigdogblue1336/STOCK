@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -165,6 +165,87 @@ def find_contract(
         if row.get("strike") is not None and math.isclose(row["strike"], strike, abs_tol=1e-6):
             return row
     return None
+
+
+def get_price_history(ticker: str, period: str = "2y") -> list[dict]:
+    """Daily close price history for `ticker`, oldest first. Used by the macro gate
+    (VIX/VIX3M/HYG/TLT/breadth-basket levels and moving averages)."""
+    _require_yfinance()
+    try:
+        hist = yf.Ticker(ticker).history(period=period)
+    except Exception as exc:  # pragma: no cover - network dependent
+        raise MarketDataError(f"Could not fetch price history for {ticker}: {exc}") from exc
+
+    if hist.empty:
+        raise MarketDataError(f"No price history returned for {ticker}")
+
+    records = []
+    for idx, row in hist.iterrows():
+        close = _clean(row.get("Close"))
+        if close is None:
+            continue
+        records.append({"date": idx.date().isoformat(), "close": close})
+    return records
+
+
+def _parse_news_timestamp(content: dict, raw: dict) -> Optional[datetime]:
+    """yfinance's .news schema has shifted over versions; handle both."""
+    ts = raw.get("providerPublishTime")
+    if ts:
+        try:
+            return datetime.utcfromtimestamp(int(ts))
+        except (TypeError, ValueError, OSError):
+            pass
+
+    pub_date = content.get("pubDate") or content.get("displayTime")
+    if pub_date:
+        try:
+            return datetime.fromisoformat(str(pub_date).replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            pass
+
+    return None
+
+
+def get_news(ticker: str, window_days: int = 3) -> list[dict]:
+    """Recent headlines for `ticker` via yfinance .news, filtered to the trailing window_days.
+
+    Items whose publish time can't be determined are kept (best effort) rather than dropped.
+    """
+    _require_yfinance()
+    try:
+        raw_items = yf.Ticker(ticker).news or []
+    except Exception as exc:  # pragma: no cover - network dependent
+        raise MarketDataError(f"Could not fetch news for {ticker}: {exc}") from exc
+
+    cutoff = datetime.utcnow() - timedelta(days=window_days)
+    items = []
+    for raw in raw_items:
+        content = raw.get("content") if isinstance(raw.get("content"), dict) else raw
+
+        title = content.get("title") or raw.get("title")
+        if not title:
+            continue
+
+        provider = content.get("provider")
+        publisher = provider.get("displayName") if isinstance(provider, dict) else raw.get("publisher")
+
+        canonical = content.get("canonicalUrl")
+        link = canonical.get("url") if isinstance(canonical, dict) else raw.get("link")
+
+        published_at = _parse_news_timestamp(content, raw)
+        if published_at is not None and published_at < cutoff:
+            continue
+
+        items.append(
+            {
+                "title": title,
+                "publisher": publisher,
+                "link": link,
+                "published_at": published_at.isoformat() + "Z" if published_at else None,
+            }
+        )
+    return items
 
 
 def get_sector_fallback(ticker: str) -> Optional[str]:

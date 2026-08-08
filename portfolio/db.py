@@ -109,10 +109,36 @@ CREATE TABLE IF NOT EXISTS iv_environment (
     near_expiry     INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS macro_gate (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof_date       TEXT NOT NULL,
+    run_timestamp   TEXT NOT NULL,
+    composite_score REAL,
+    weights_json    TEXT NOT NULL,
+    components_json TEXT NOT NULL,
+    UNIQUE(asof_date)
+);
+
+CREATE TABLE IF NOT EXISTS news_analysis (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker                  TEXT NOT NULL,
+    asof_date               TEXT NOT NULL,
+    run_timestamp           TEXT NOT NULL,
+    summary                 TEXT,
+    sentiment               TEXT,  -- 'positive' | 'neutral' | 'negative'
+    key_drivers_json        TEXT,
+    position_flag           INTEGER NOT NULL DEFAULT 0,
+    position_flag_detail    TEXT,
+    headlines_json          TEXT,
+    model                   TEXT,
+    UNIQUE(ticker, asof_date)
+);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_date ON snapshots(ticker, asof_date);
 CREATE INDEX IF NOT EXISTS idx_valuations_position_date ON valuations(position_id, asof_date);
 CREATE INDEX IF NOT EXISTS idx_allocations_asof ON allocations(asof_date, dimension);
 CREATE INDEX IF NOT EXISTS idx_iv_environment_position_date ON iv_environment(position_id, asof_date);
+CREATE INDEX IF NOT EXISTS idx_news_analysis_ticker_date ON news_analysis(ticker, asof_date);
 """
 
 
@@ -300,5 +326,72 @@ def insert_iv_environment(conn: sqlite3.Connection, asof_date: str, run_timestam
             asof_date, run_timestamp, row["position_id"], row["ticker"], row["current_iv"],
             row["iv_rank"], row["iv_percentile"], row["sample_size"], row["status"],
             row["rich_cheap"], row["dte"], int(row["near_expiry"]),
+        ),
+    )
+
+
+def insert_macro_gate(
+    conn: sqlite3.Connection,
+    asof_date: str,
+    run_timestamp: str,
+    composite_score: Optional[float],
+    weights: dict[str, float],
+    components: list[dict],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO macro_gate (asof_date, run_timestamp, composite_score, weights_json, components_json)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(asof_date) DO UPDATE SET
+            run_timestamp=excluded.run_timestamp,
+            composite_score=excluded.composite_score,
+            weights_json=excluded.weights_json,
+            components_json=excluded.components_json
+        """,
+        (asof_date, run_timestamp, composite_score, json.dumps(weights), json.dumps(components)),
+    )
+
+
+def get_news_analysis(conn: sqlite3.Connection, ticker: str, asof_date: str) -> Optional[dict]:
+    """Cache lookup: today's stored analysis for `ticker`, or None if we haven't called Claude yet."""
+    row = conn.execute(
+        "SELECT * FROM news_analysis WHERE ticker = ? AND asof_date = ?",
+        (ticker, asof_date),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "ticker": row["ticker"],
+        "asof_date": row["asof_date"],
+        "summary": row["summary"],
+        "sentiment": row["sentiment"],
+        "key_drivers": json.loads(row["key_drivers_json"]) if row["key_drivers_json"] else [],
+        "position_flag": bool(row["position_flag"]),
+        "position_flag_detail": row["position_flag_detail"] or "",
+        "headlines": json.loads(row["headlines_json"]) if row["headlines_json"] else [],
+        "model": row["model"],
+    }
+
+
+def save_news_analysis(conn: sqlite3.Connection, run_timestamp: str, analysis: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT INTO news_analysis
+            (ticker, asof_date, run_timestamp, summary, sentiment, key_drivers_json,
+             position_flag, position_flag_detail, headlines_json, model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ticker, asof_date) DO NOTHING
+        """,
+        (
+            analysis["ticker"],
+            analysis["asof_date"],
+            run_timestamp,
+            analysis["summary"],
+            analysis["sentiment"],
+            json.dumps(analysis["key_drivers"]),
+            int(analysis["position_flag"]),
+            analysis["position_flag_detail"],
+            json.dumps(analysis["headlines"]),
+            analysis.get("model"),
         ),
     )
