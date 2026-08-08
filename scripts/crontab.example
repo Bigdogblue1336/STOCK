@@ -1,0 +1,13 @@
+# Portfolio monitor: run the full pipeline once each weekday after US market
+# close (4:00pm ET), logging to logs/portfolio_YYYY-MM-DD.log.
+#
+# Install with: crontab -e   (then paste the line below, with paths adjusted)
+# cron's PATH/env is minimal -- run_daily.sh cds into the repo itself, loads
+# .env if present, and activates venv/.venv if present, so cron doesn't need
+# to know about any of that.
+#
+# Times are in the cron daemon's local system time. If your server isn't set
+# to US Eastern, adjust the hour/minute (or set CRON_TZ=America/New_York on
+# the line above this one, if your cron supports the CRON_TZ prefix).
+
+30 16 * * 1-5 /absolute/path/to/STOCK/scripts/run_daily.sh >> /absolute/path/to/STOCK/logs/cron.log 2>&1

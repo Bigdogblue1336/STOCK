@@ -3,3 +3,8 @@ __pycache__/
 *.db
 snapshots/*.json
 !snapshots/.gitkeep
+logs/*.log
+!logs/.gitkeep
+.env
+venv/
+.venv/

@@ -1,2 +1,5 @@
 yfinance>=0.2.40
 anthropic>=0.40.0
+streamlit>=1.38.0
+plotly>=5.24.0
+pandas>=2.2.0

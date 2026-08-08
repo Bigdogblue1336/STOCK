@@ -40,6 +40,43 @@ def days_to_years(days: int) -> float:
     return days / DAYS_PER_YEAR
 
 
+def bs_price(
+    option_type: str,
+    spot: float,
+    strike: float,
+    days_to_expiry: int,
+    risk_free_rate: float,
+    iv: Optional[float],
+) -> Optional[float]:
+    """Black-Scholes theoretical price per share. None if inputs are degenerate.
+
+    At days_to_expiry <= 0 (or a missing IV), falls back to intrinsic value --
+    used by the dashboard's illustrative decay curve, not for live marks.
+    """
+    if spot is None or spot <= 0 or strike is None or strike <= 0:
+        return None
+
+    option_type = option_type.lower()
+    intrinsic = max(spot - strike, 0.0) if option_type == "call" else max(strike - spot, 0.0)
+
+    if iv is None or iv <= 0 or days_to_expiry is None or days_to_expiry <= 0:
+        return intrinsic
+
+    T = days_to_years(days_to_expiry)
+    sigma = iv
+    r = risk_free_rate
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+
+    if option_type == "call":
+        return spot * _norm_cdf(d1) - strike * math.exp(-r * T) * _norm_cdf(d2)
+    elif option_type == "put":
+        return strike * math.exp(-r * T) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+    else:
+        raise ValueError(f"option_type must be 'call' or 'put', got {option_type!r}")
+
+
 def compute_greeks(
     option_type: str,
     spot: float,

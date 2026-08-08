@@ -134,11 +134,35 @@ CREATE TABLE IF NOT EXISTS news_analysis (
     UNIQUE(ticker, asof_date)
 );
 
+CREATE TABLE IF NOT EXISTS chain_diffs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof_date           TEXT NOT NULL,
+    run_timestamp       TEXT NOT NULL,
+    ticker              TEXT NOT NULL,
+    new_expiries_json   TEXT NOT NULL,
+    new_strikes_json    TEXT NOT NULL,
+    UNIQUE(ticker, asof_date)
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof_date       TEXT NOT NULL,
+    run_timestamp   TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    position_id     TEXT,
+    alert_type      TEXT NOT NULL,  -- target_hit | stop_hit | target_near | iv_change | new_strikes | new_expiry
+    severity        TEXT NOT NULL,  -- high | warn | info
+    message         TEXT NOT NULL,
+    driver          TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_date ON snapshots(ticker, asof_date);
 CREATE INDEX IF NOT EXISTS idx_valuations_position_date ON valuations(position_id, asof_date);
 CREATE INDEX IF NOT EXISTS idx_allocations_asof ON allocations(asof_date, dimension);
 CREATE INDEX IF NOT EXISTS idx_iv_environment_position_date ON iv_environment(position_id, asof_date);
 CREATE INDEX IF NOT EXISTS idx_news_analysis_ticker_date ON news_analysis(ticker, asof_date);
+CREATE INDEX IF NOT EXISTS idx_chain_diffs_ticker_date ON chain_diffs(ticker, asof_date);
+CREATE INDEX IF NOT EXISTS idx_alerts_asof ON alerts(asof_date);
 """
 
 
@@ -395,3 +419,60 @@ def save_news_analysis(conn: sqlite3.Connection, run_timestamp: str, analysis: d
             analysis.get("model"),
         ),
     )
+
+
+def save_chain_diff(
+    conn: sqlite3.Connection,
+    asof_date: str,
+    run_timestamp: str,
+    ticker: str,
+    new_expiries: list[str],
+    new_strikes: dict[str, list[float]],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO chain_diffs (asof_date, run_timestamp, ticker, new_expiries_json, new_strikes_json)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(ticker, asof_date) DO UPDATE SET
+            run_timestamp=excluded.run_timestamp,
+            new_expiries_json=excluded.new_expiries_json,
+            new_strikes_json=excluded.new_strikes_json
+        """,
+        (asof_date, run_timestamp, ticker, json.dumps(new_expiries), json.dumps(new_strikes)),
+    )
+
+
+def get_chain_diffs(conn: sqlite3.Connection, asof_date: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT ticker, new_expiries_json, new_strikes_json FROM chain_diffs WHERE asof_date = ?",
+        (asof_date,),
+    ).fetchall()
+    return [
+        {
+            "ticker": r["ticker"],
+            "new_expiries": json.loads(r["new_expiries_json"]),
+            "new_strikes": json.loads(r["new_strikes_json"]),
+        }
+        for r in rows
+    ]
+
+
+def insert_alert(conn: sqlite3.Connection, asof_date: str, run_timestamp: str, alert: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT INTO alerts (asof_date, run_timestamp, ticker, position_id, alert_type, severity, message, driver)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            asof_date, run_timestamp, alert["ticker"], alert.get("position_id"),
+            alert["alert_type"], alert["severity"], alert["message"], alert.get("driver"),
+        ),
+    )
+
+
+def get_alerts(conn: sqlite3.Connection, asof_date: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM alerts WHERE asof_date = ? ORDER BY "
+        "CASE severity WHEN 'high' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, ticker",
+        (asof_date,),
+    ).fetchall()

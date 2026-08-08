@@ -57,3 +57,18 @@ DEFAULT_BREADTH_TICKERS = [
 DEFAULT_NEWS_WINDOW_DAYS = 3
 DEFAULT_NEWS_MODEL = os.environ.get("PORTFOLIO_NEWS_MODEL", "claude-haiku-4-5-20251001")
 DEFAULT_NEWS_MAX_TOKENS = 700
+
+# --- Diff / alerts / notifier layer ---
+
+# New-strike detection: keep a newly-listed strike only if it's within this fraction
+# of some held strike on the same underlying (e.g. 0.30 = within +/-30%).
+DEFAULT_STRIKE_BAND = 0.30
+
+# Alerts are facts about the book, never trade advice.
+DEFAULT_TARGET_NEAR_PCT = 80.0  # progress_to_target_pct >= this (and < 100) => target_near
+DEFAULT_IV_CHANGE_PCT = 20.0  # abs relative IV change vs prior session's snapshot => iv_change
+
+# Notifier: off by default. 'none' | 'telegram' | 'imessage'.
+DEFAULT_NOTIFIER_CHANNEL = os.environ.get("PORTFOLIO_NOTIFIER", "none")
+# macOS Messages.app buddy id (phone/email) for the iMessage channel.
+DEFAULT_IMESSAGE_RECIPIENT = os.environ.get("IMESSAGE_RECIPIENT", "")

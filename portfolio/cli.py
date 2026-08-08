@@ -27,12 +27,15 @@ import json
 import logging
 from datetime import date, datetime
 
-from . import config, db as db_module
+from . import config, db as db_module, notifier as notifier_module
+from .alerts import Alert, build_diff_alerts, check_iv_change_alert, check_position_alerts
 from .analytics import PortfolioAnalytics, compute_portfolio_analytics, print_analytics_report, save_portfolio_analytics
 from .black_scholes import compute_greeks
+from .diff import ChainDiff, compute_diff
 from .macro_gate import MacroGate, MacroGateError, compute_macro_gate
 from .market_data import (
     MarketDataError,
+    find_contract,
     get_full_chain_snapshot,
     get_option_market_data,
     get_underlying_quote,
@@ -123,6 +126,26 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--skip-news", action="store_true",
         help="Skip the Claude news analysis phase entirely (no API calls, no charges)",
     )
+    p.add_argument(
+        "--strike-band", type=float, default=config.DEFAULT_STRIKE_BAND,
+        help=f"New-strike detection band around held strikes, as a fraction (default {config.DEFAULT_STRIKE_BAND})",
+    )
+    p.add_argument(
+        "--target-near-pct", type=float, default=config.DEFAULT_TARGET_NEAR_PCT,
+        help=f"progress_to_target_pct at/above which a target_near alert fires (default {config.DEFAULT_TARGET_NEAR_PCT})",
+    )
+    p.add_argument(
+        "--iv-change-pct", type=float, default=config.DEFAULT_IV_CHANGE_PCT,
+        help=f"Absolute relative IV move vs prior session that triggers an iv_change alert (default {config.DEFAULT_IV_CHANGE_PCT})",
+    )
+    p.add_argument(
+        "--notifier", default=config.DEFAULT_NOTIFIER_CHANNEL, choices=["none", "telegram", "imessage"],
+        help="Push today's alerts to this channel (default: none / off)",
+    )
+    p.add_argument(
+        "--imessage-recipient", default=config.DEFAULT_IMESSAGE_RECIPIENT,
+        help="macOS Messages buddy id (phone/email) for the imessage notifier channel",
+    )
     return p.parse_args(argv)
 
 
@@ -161,7 +184,9 @@ def value_position(
     return compute_valuation(position, market, asof, greeks)
 
 
-def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics, MacroGate, list[NewsAnalysis]]:
+def run(
+    argv=None,
+) -> tuple[list[Valuation], PortfolioAnalytics, MacroGate, list[NewsAnalysis], list[Alert]]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
 
@@ -183,6 +208,8 @@ def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics, MacroGate, list
     grouped = _group_by_ticker(positions)
     valuations: list[Valuation] = []
     sector_map = load_sector_map(args.sector_map)
+    chain_diffs: dict[str, ChainDiff] = {}
+    iv_change_alerts: list[Alert] = []
 
     with db_module.open_db(args.db) as conn:
         for position in positions:
@@ -197,10 +224,26 @@ def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics, MacroGate, list
                 continue
 
             chain_snapshot = None
+            prior_snapshot = None
             if has_options:
+                prior_snapshot = db_module.get_prior_snapshot(conn, ticker, asof.isoformat())
                 try:
                     chain_snapshot = get_full_chain_snapshot(ticker, asof)
                     write_snapshot(conn, args.snapshot_dir, ticker, asof, chain_snapshot)
+
+                    held_strikes = [p.strike for p in ticker_positions if p.is_option and p.strike]
+                    diff_result = compute_diff(
+                        ticker,
+                        prior_snapshot["data"] if prior_snapshot else None,
+                        chain_snapshot,
+                        held_strikes,
+                        strike_band=args.strike_band,
+                    )
+                    chain_diffs[ticker] = diff_result
+                    db_module.save_chain_diff(
+                        conn, asof.isoformat(), run_timestamp, ticker,
+                        diff_result.new_expiries, diff_result.new_strikes,
+                    )
                 except MarketDataError as exc:
                     logger.error("Could not pull option chain for %s: %s", ticker, exc)
 
@@ -220,6 +263,17 @@ def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics, MacroGate, list
                 row["run_timestamp"] = run_timestamp
                 db_module.insert_valuation(conn, row)
                 valuations.append(valuation)
+
+                if position.is_option and prior_snapshot is not None:
+                    prior_contract = find_contract(
+                        prior_snapshot["data"], position.expiry, position.option_type, position.strike
+                    )
+                    prior_iv = prior_contract.get("iv") if prior_contract else None
+                    iv_alert = check_iv_change_alert(
+                        position, valuation.iv, prior_iv, threshold_pct=args.iv_change_pct
+                    )
+                    if iv_alert:
+                        iv_change_alerts.append(iv_alert)
 
         valued_positions = [p for p in positions if p.id in {v.position_id for v in valuations}]
         analytics = compute_portfolio_analytics(
@@ -273,11 +327,40 @@ def run(argv=None) -> tuple[list[Valuation], PortfolioAnalytics, MacroGate, list
                     except Exception as exc:
                         logger.error("News analysis failed for %s: %s", ticker, exc)
 
+        news_by_ticker = {n.ticker: n for n in news_results}
+        valuation_by_id = {v.position_id: v for v in valuations}
+
+        alerts: list[Alert] = list(iv_change_alerts)
+        for position in valued_positions:
+            alerts.extend(
+                check_position_alerts(position, valuation_by_id[position.id], target_near_pct=args.target_near_pct)
+            )
+        for ticker, diff_result in chain_diffs.items():
+            if diff_result.is_empty():
+                continue
+            news = news_by_ticker.get(ticker)
+            driver = news.key_drivers[0] if news and news.key_drivers else None
+            alerts.extend(build_diff_alerts(diff_result, driver=driver))
+
+        severity_order = {"high": 0, "warn": 1, "info": 2}
+        alerts.sort(key=lambda a: (severity_order.get(a.severity, 9), a.ticker))
+
+        for alert in alerts:
+            db_module.insert_alert(conn, asof.isoformat(), run_timestamp, alert.to_dict())
+
     print_report(valuations, asof)
     print_analytics_report(analytics)
     print_macro_gate_report(macro_gate)
     print_news_report(news_results)
-    return valuations, analytics, macro_gate, news_results
+    print_alerts_report(alerts)
+
+    sent = notifier_module.maybe_send(
+        [a.to_dict() for a in alerts], asof, channel=args.notifier, imessage_recipient=args.imessage_recipient
+    )
+    if sent:
+        logger.info("Alerts pushed via %s notifier", args.notifier)
+
+    return valuations, analytics, macro_gate, news_results, alerts
 
 
 def print_report(valuations: list[Valuation], asof: date) -> None:
@@ -327,6 +410,17 @@ def print_news_report(news_results: list[NewsAnalysis]) -> None:
             print(f"    Drivers: {', '.join(n.key_drivers)}")
         if n.position_flag and n.position_flag_detail:
             print(f"    Position note: {n.position_flag_detail}")
+
+
+def print_alerts_report(alerts: list[Alert]) -> None:
+    print(f"\nAlerts (facts about the book; never a trade recommendation)")
+    print("-" * 72)
+    if not alerts:
+        print("  (none)")
+        return
+    for a in alerts:
+        driver_note = f"  [driver: {a.driver}]" if a.driver else ""
+        print(f"  [{a.severity.upper():<4}] {a.alert_type:<12} {a.message}{driver_note}")
 
 
 if __name__ == "__main__":
